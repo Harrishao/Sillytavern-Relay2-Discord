@@ -1,0 +1,35 @@
+# 配置文件（含敏感信息）
+config.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 截图输出
+screenshot/*.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Playwright MCP
+.playwright-mcp/
+
+# Claude
+.claude/
+
+# 运行时日志
+console_log.txt
+
+# 白名单数据
+admin_whitelist.json
+
+# 虚拟环境
+venv/
+.venv/
+env/

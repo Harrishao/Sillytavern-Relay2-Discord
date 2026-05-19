@@ -1,6 +1,6 @@
 # SillyTavern Relay2 Discord
 
-通过 Discord 斜杠命令远程操控 [SillyTavern](https://github.com/SillyTavern/SillyTavern) 酒馆，支持消息发送、截图回传、角色/聊天/用户设定管理等功能。
+通过 Discord 斜杠命令远程操控 [SillyTavern](https://github.com/SillyTavern/SillyTavern) ，支持消息发送、截图回传、角色/聊天/用户设定管理等功能。
 
 ## 功能
 

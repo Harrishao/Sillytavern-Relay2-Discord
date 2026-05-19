@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import traceback
 
 import discord
@@ -10,12 +11,58 @@ import admin
 import core
 
 
-class STCommands(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+# ═══════════════════════════════════════════════════════════════
+#  stand-alone helpers
+# ═══════════════════════════════════════════════════════════════
 
-    async def _check_whitelist(self, interaction: discord.Interaction) -> bool:
-        """检查用户是否在白名单中，不在则发送 ephemeral 提示并返回 False"""
+async def _safe_followup(interaction: discord.Interaction, *,
+                         content: str = None, file_path: str = None,
+                         fallback_text: str = None,
+                         view: discord.ui.View = None) -> bool:
+    """安全发送 followup，优先图片，网络错误时回退纯文本"""
+    try:
+        if file_path and os.path.isfile(file_path):
+            await interaction.followup.send(
+                content=content or "", file=discord.File(file_path), view=view,
+            )
+        else:
+            await interaction.followup.send(content=content or "", view=view)
+        return True
+    except (discord.HTTPException, OSError) as e:
+        print(f"[st_commands] 文件上传失败(网络错误): {e}")
+        try:
+            fallback = fallback_text or (content or "操作已完成，但截图上传失败，请稍后重试 /lastmsg 查看。")
+            await interaction.followup.send(content=fallback)
+            return True
+        except Exception as e2:
+            print(f"[st_commands] 文本回退也失败了: {e2}")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Interactive Views
+# ═══════════════════════════════════════════════════════════════
+
+class MessageActionView(discord.ui.View):
+    """消息结果按钮：左翻页 / 右翻页 / 重新生成"""
+
+    def __init__(self, cog: "STCommands", timeout: float = 60):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+
+        left_btn = discord.ui.Button(label="◀ 左翻页", style=discord.ButtonStyle.secondary, row=0)
+        left_btn.callback = self._on_left
+        self.add_item(left_btn)
+
+        right_btn = discord.ui.Button(label="▶ 右翻页", style=discord.ButtonStyle.secondary, row=0)
+        right_btn.callback = self._on_right
+        self.add_item(right_btn)
+
+        regen_btn = discord.ui.Button(label="🔄 重新生成", style=discord.ButtonStyle.primary, row=0)
+        regen_btn.callback = self._on_regenerate
+        self.add_item(regen_btn)
+
+    async def _check_access(self, interaction: discord.Interaction) -> bool:
         if not admin.is_whitelisted(interaction.user.id):
             await interaction.response.send_message(
                 "管理员模式已开启，但你不在白名单中哦...", ephemeral=True
@@ -23,52 +70,333 @@ class STCommands(commands.Cog):
             return False
         return True
 
-    async def _safe_followup(self, interaction: discord.Interaction, *,
-                             content: str = None, file_path: str = None,
-                             fallback_text: str = None) -> bool:
-        """
-        安全发送 followup 消息。
-        优先发送图片文件，网络错误时尝试发送纯文本回退。
-        返回 True 表示发送成功。
-        """
+    async def _on_left(self, interaction: discord.Interaction):
+        if not await self._check_access(interaction):
+            return
+        await interaction.response.defer()
         try:
-            if file_path and os.path.isfile(file_path):
+            ok = await core.swipe_left()
+            if not ok:
+                await interaction.followup.send("左翻页失败，没有更多备选回复或当前不在聊天中。", ephemeral=True)
+                return
+            path = await core.capture_screenshot()
+            if path and os.path.isfile(path):
+                await _safe_followup(interaction, file_path=path, view=MessageActionView(self.cog))
+            else:
+                await interaction.followup.send("截图失败，请稍后重试...")
+        finally:
+            # 删除旧消息
+            try:
+                await interaction.message.delete()
+            except Exception:
+                pass
+
+    async def _on_right(self, interaction: discord.Interaction):
+        if not await self._check_access(interaction):
+            return
+        if not core.acquire_lock():
+            await interaction.response.send_message(
+                "有正在处理中的消息，请稍后再试...", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        try:
+            result = await core.swipe_right()
+            if result is None:
+                await interaction.followup.send("右翻页失败，当前不在聊天中。", ephemeral=True)
+                return
+            if result == "generating":
+                response = await core.wait_for_response()
+                if not response:
+                    await interaction.followup.send("等待LLM回复超时...", ephemeral=True)
+                    return
+            path = await core.capture_screenshot()
+            if path and os.path.isfile(path):
+                await _safe_followup(interaction, file_path=path, view=MessageActionView(self.cog))
+            else:
+                await interaction.followup.send("截图失败，请稍后重试...")
+        finally:
+            core.release_lock()
+            try:
+                await interaction.message.delete()
+            except Exception:
+                pass
+
+    async def _on_regenerate(self, interaction: discord.Interaction):
+        if not await self._check_access(interaction):
+            return
+        if not core.acquire_lock():
+            await interaction.response.send_message(
+                "有正在处理中的消息，请稍后再试...或使用 /stop 中止", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        try:
+            ok = await core.regenerate()
+            if not ok:
+                await interaction.followup.send("重新生成触发失败...", ephemeral=True)
+                return
+            response = await core.wait_for_response()
+            if not response:
+                await interaction.followup.send("等待LLM回复超时...", ephemeral=True)
+                return
+            path = await core.capture_screenshot()
+            if path and os.path.isfile(path):
+                await _safe_followup(interaction, file_path=path, view=MessageActionView(self.cog))
+            else:
+                content = response.get("content", "")[:1900]
                 await interaction.followup.send(
-                    content=content or "", file=discord.File(file_path)
+                    f"```\n{content}\n```", view=MessageActionView(self.cog)
+                )
+        finally:
+            core.release_lock()
+            try:
+                await interaction.message.delete()
+            except Exception:
+                pass
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+class ListSelectView(discord.ui.View):
+    """列表按钮：数字选择 + Exit"""
+
+    def __init__(self, cog: "STCommands", items: list, action_type: str,
+                 channel_id: int, user_id: int, char_name: str = "", timeout: float = 60):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.items = items
+        self.action_type = action_type
+        self.channel_id = channel_id
+        self.user_id = user_id
+        self.char_name = char_name
+        self._message_id = None
+
+        max_show = min(len(items), 20)
+        for i in range(max_show):
+            btn = discord.ui.Button(
+                label=str(i), style=discord.ButtonStyle.secondary,
+                row=i // 5
+            )
+            btn.callback = self._make_callback(i)
+            self.add_item(btn)
+
+        exit_btn = discord.ui.Button(label="Exit", style=discord.ButtonStyle.danger, row=4)
+        exit_btn.callback = self._on_exit
+        self.add_item(exit_btn)
+
+    def _make_callback(self, index: int):
+        async def callback(interaction: discord.Interaction):
+            await self._on_select(interaction, index)
+        return callback
+
+    async def _check_access(self, interaction: discord.Interaction) -> bool:
+        if not admin.is_whitelisted(interaction.user.id):
+            await interaction.response.send_message(
+                "管理员模式已开启，但你不在白名单中哦...", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction, index: int):
+        if not await self._check_access(interaction):
+            return
+        await interaction.response.defer()
+
+        if self.action_type == "char_pick":
+            await self._handle_char_pick(interaction, index)
+        elif self.action_type in ("chat_pick", "chat_pick_for_char"):
+            await self._handle_chat_pick(interaction, index)
+        elif self.action_type == "user_pick":
+            await self._handle_user_pick(interaction, index)
+
+        # 删除旧列表消息
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+        # 清除 pending
+        self.cog._clear_pending(interaction.user.id)
+
+    async def _handle_char_pick(self, interaction: discord.Interaction, index: int):
+        char = self.items[index]
+        avatar = char.get("avatar", "")
+        char_name = char.get("name", "?")
+
+        chats = await core.fetch_character_chats(avatar)
+        if not chats:
+            await interaction.followup.send(f"角色 **{char_name}** 没有聊天记录。")
+            return
+
+        if len(chats) == 1:
+            file_name = chats[0].get("file_name", "")
+            if not file_name:
+                await interaction.followup.send("无法获取聊天文件名。")
+                return
+            ok = await core.open_chat(file_name)
+            if not ok:
+                await interaction.followup.send("切换聊天失败。")
+                return
+            await asyncio.sleep(2)
+            path = await core.capture_screenshot()
+            if path and os.path.isfile(path):
+                await _safe_followup(
+                    interaction, content=f"已切换到: {char_name}", file_path=path,
+                    view=MessageActionView(self.cog),
                 )
             else:
-                await interaction.followup.send(content=content or "")
-            return True
-        except (discord.HTTPException, OSError) as e:
-            print(f"[st_commands] 文件上传失败(网络错误): {e}")
+                await interaction.followup.send("截图失败...")
+        else:
+            # 显示角色聊天列表
+            lines = [f"**{char_name} 的聊天记录 ({len(chats)}条)**"]
+            for i, c in enumerate(chats[:20]):
+                fname = c.get("file_name", "?").replace(".jsonl", "")
+                items_count = c.get("chat_items", 0)
+                lines.append(f"`{i}` — {fname}  _(消息:{items_count})_")
+            if len(chats) > 20:
+                lines.append(f"...还有 {len(chats) - 20} 条")
+            lines.append(f"使用按钮选择聊天，或 `/chat <序号>` / `/exit` 退出")
+            msg = "\n".join(lines)
+            if len(msg) > 2000:
+                msg = msg[:1950] + "\n...(截断)"
+
+            self.cog._set_pending(
+                interaction.user.id, "chat_pick_for_char", chats,
+                char_name=char_name,
+            )
+            view = ListSelectView(
+                self.cog, chats, "chat_pick_for_char",
+                channel_id=interaction.channel_id,
+                user_id=interaction.user.id,
+                char_name=char_name,
+            )
+            sent = await interaction.followup.send(msg, view=view)
+            view._message_id = sent.id
+
+    async def _handle_chat_pick(self, interaction: discord.Interaction, index: int):
+        chat = self.items[index]
+        file_name = chat.get("file_name", "")
+        if not file_name:
+            await interaction.followup.send("无法获取聊天文件名。")
+            return
+
+        ok = await core.open_chat(file_name)
+        if not ok:
+            await interaction.followup.send("切换聊天失败。")
+            return
+
+        await asyncio.sleep(2)
+        path = await core.capture_screenshot()
+        name = file_name.replace(".jsonl", "")
+        if path and os.path.isfile(path):
+            await _safe_followup(
+                interaction, content=f"已切换到: {name}", file_path=path,
+                view=MessageActionView(self.cog),
+            )
+        else:
+            await interaction.followup.send("截图失败...")
+
+    async def _handle_user_pick(self, interaction: discord.Interaction, index: int):
+        p = self.items[index]
+        ok = await core.select_persona(p["avatar_id"])
+        if not ok:
+            await interaction.followup.send("切换用户设定失败。")
+            return
+        current = await core.get_current_persona()
+        await interaction.followup.send(f"已切换用户设定为: **{current}** _(序号:{index})_")
+
+    async def _on_exit(self, interaction: discord.Interaction):
+        if not await self._check_access(interaction):
+            return
+        self.cog._clear_pending(interaction.user.id)
+        await interaction.response.send_message("已退出输入窗口。", ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        self.cog._clear_pending(self.user_id)
+        if self._message_id:
             try:
-                fallback = fallback_text or (content or "操作已完成，但截图上传失败，请稍后重试 /lastmsg 查看。")
-                await interaction.followup.send(content=fallback)
-                return True
-            except Exception as e2:
-                print(f"[st_commands] 文本回退也失败了: {e2}")
-                return False
+                channel = self.cog.bot.get_channel(self.channel_id)
+                if channel:
+                    msg = await channel.fetch_message(self._message_id)
+                    await msg.delete()
+                    await channel.send(
+                        f"<@{self.user_id}> 输入窗口已过期，请重新使用命令。",
+                        delete_after=10,
+                    )
+            except Exception as e:
+                print(f"[st_commands] 过期消息清理失败: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Cog
+# ═══════════════════════════════════════════════════════════════
+
+class STCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self._pending = {}  # {user_id: {action, data, expires_at, message_id, channel_id, char_name}}
+
+    # --- pending state ---
+
+    def _set_pending(self, user_id: int, action: str, data, **kwargs):
+        self._pending[user_id] = {
+            "action": action,
+            "data": data,
+            "expires_at": time.time() + 60,
+            **kwargs,
+        }
+
+    def _get_pending(self, user_id: int) -> dict | None:
+        p = self._pending.get(user_id)
+        if not p:
+            return None
+        if time.time() > p["expires_at"]:
+            del self._pending[user_id]
+            return None
+        return p
+
+    def _clear_pending(self, user_id: int):
+        self._pending.pop(user_id, None)
+
+    # --- whitelist ---
+
+    async def _check_whitelist(self, interaction: discord.Interaction) -> bool:
+        if not admin.is_whitelisted(interaction.user.id):
+            await interaction.response.send_message(
+                "管理员模式已开启，但你不在白名单中哦...", ephemeral=True
+            )
+            return False
+        return True
+
+    # --- error ---
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error):
-        """Cog 级斜杠命令错误处理"""
-        # 如果已经发送过响应，尝试 followup 报错
         if interaction.response.is_done():
             try:
                 await interaction.followup.send("执行过程中遇到网络波动，请稍后重试...")
             except Exception:
                 pass
             return
-
-        # 尚未响应，发送 ephemeral 报错
         try:
             await interaction.response.send_message(
                 "执行过程中遇到错误，请稍后重试...", ephemeral=True
             )
         except Exception:
             pass
-
         print(f"[st_commands] 命令异常: {error}")
         traceback.print_exception(type(error), error, error.__traceback__)
+
+    # ═══════════════════════════════════════════════════════
+    #  /st
+    # ═══════════════════════════════════════════════════════
 
     @app_commands.command(name="st", description="发送消息到酒馆并获取AI回复截图")
     @app_commands.describe(message="要发送的消息内容")
@@ -91,15 +419,22 @@ class STCommands(commands.Cog):
 
             path = result.get("screenshot_path")
             if path and os.path.isfile(path):
-                await self._safe_followup(interaction, file_path=path)
+                await interaction.followup.send(
+                    view=MessageActionView(self),
+                    file=discord.File(path),
+                )
             else:
                 content = result["content"][:1900]
-                await interaction.followup.send(f"```\n{content}\n```")
+                view = MessageActionView(self)
+                await interaction.followup.send(f"```\n{content}\n```", view=view)
         finally:
             core.release_lock()
 
-    @app_commands.command(name="stop", description="停止当前正在生成的AI回复")
+    # ═══════════════════════════════════════════════════════
+    #  /stop
+    # ═══════════════════════════════════════════════════════
 
+    @app_commands.command(name="stop", description="停止当前正在生成的AI回复")
     async def cmd_stop(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
@@ -111,32 +446,44 @@ class STCommands(commands.Cog):
         else:
             await interaction.followup.send("没有正在进行的生成。")
 
-    @app_commands.command(name="lastmsg", description="截取酒馆最后一条消息")
+    # ═══════════════════════════════════════════════════════
+    #  /lastmsg
+    # ═══════════════════════════════════════════════════════
 
+    @app_commands.command(name="lastmsg", description="截取酒馆最后一条消息")
     async def cmd_lastmsg(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
         await interaction.response.defer()
         path = await core.capture_screenshot()
         if path and os.path.isfile(path):
-            await self._safe_followup(interaction, file_path=path)
+            await interaction.followup.send(
+                view=MessageActionView(self),
+                file=discord.File(path),
+            )
         else:
             await interaction.followup.send("截图失败，请稍后重试...")
 
-    @app_commands.command(name="ss", description="全页截取酒馆当前界面")
+    # ═══════════════════════════════════════════════════════
+    #  /ss
+    # ═══════════════════════════════════════════════════════
 
+    @app_commands.command(name="ss", description="全页截取酒馆当前界面")
     async def cmd_ss(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
         await interaction.response.defer()
         path = await core.capture_full_screenshot()
         if path and os.path.isfile(path):
-            await self._safe_followup(interaction, file_path=path)
+            await _safe_followup(interaction, file_path=path)
         else:
             await interaction.followup.send("截图失败，请稍后重试...")
 
-    @app_commands.command(name="rf", description="刷新酒馆页面")
+    # ═══════════════════════════════════════════════════════
+    #  /rf
+    # ═══════════════════════════════════════════════════════
 
+    @app_commands.command(name="rf", description="刷新酒馆页面")
     async def cmd_rf(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
@@ -147,13 +494,16 @@ class STCommands(commands.Cog):
             return
         path = await core.capture_full_screenshot()
         if path and os.path.isfile(path):
-            await self._safe_followup(interaction, content="页面已刷新:", file_path=path)
+            await _safe_followup(interaction, content="页面已刷新:", file_path=path)
         else:
             await interaction.followup.send("页面已刷新，但截图失败。")
 
+    # ═══════════════════════════════════════════════════════
+    #  /del
+    # ═══════════════════════════════════════════════════════
+
     @app_commands.command(name="del", description="删除酒馆当前聊天最后N条消息")
     @app_commands.describe(n="删除条数（1或2）")
-
     async def cmd_del(self, interaction: discord.Interaction, n: int = 1):
         if not await self._check_whitelist(interaction):
             return
@@ -165,12 +515,21 @@ class STCommands(commands.Cog):
         await asyncio.sleep(1)
         path = await core.capture_screenshot()
         if path and os.path.isfile(path):
-            await self._safe_followup(interaction, content=f"已删除最后 {n} 条消息:", file_path=path)
+            await interaction.followup.send(
+                content=f"已删除最后 {n} 条消息:",
+                view=MessageActionView(self),
+                file=discord.File(path),
+            )
         else:
-            await interaction.followup.send(f"已删除最后 {n} 条消息。")
+            await interaction.followup.send(
+                f"已删除最后 {n} 条消息。", view=MessageActionView(self)
+            )
+
+    # ═══════════════════════════════════════════════════════
+    #  /left
+    # ═══════════════════════════════════════════════════════
 
     @app_commands.command(name="left", description="切换到上一个备选回复（左翻页）")
-
     async def cmd_left(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
@@ -181,12 +540,18 @@ class STCommands(commands.Cog):
             return
         path = await core.capture_screenshot()
         if path and os.path.isfile(path):
-            await self._safe_followup(interaction, file_path=path)
+            await interaction.followup.send(
+                view=MessageActionView(self),
+                file=discord.File(path),
+            )
         else:
             await interaction.followup.send("截图失败，请稍后重试...")
 
-    @app_commands.command(name="right", description="切换到下一个备选回复（右翻页）")
+    # ═══════════════════════════════════════════════════════
+    #  /right
+    # ═══════════════════════════════════════════════════════
 
+    @app_commands.command(name="right", description="切换到下一个备选回复（右翻页）")
     async def cmd_right(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
@@ -209,14 +574,20 @@ class STCommands(commands.Cog):
 
             path = await core.capture_screenshot()
             if path and os.path.isfile(path):
-                await self._safe_followup(interaction, file_path=path)
+                await interaction.followup.send(
+                    view=MessageActionView(self),
+                    file=discord.File(path),
+                )
             else:
                 await interaction.followup.send("截图失败，请稍后重试...")
         finally:
             core.release_lock()
 
-    @app_commands.command(name="regenerate", description="重新生成AI回复")
+    # ═══════════════════════════════════════════════════════
+    #  /regenerate
+    # ═══════════════════════════════════════════════════════
 
+    @app_commands.command(name="regenerate", description="重新生成AI回复")
     async def cmd_regenerate(self, interaction: discord.Interaction):
         if not await self._check_whitelist(interaction):
             return
@@ -240,27 +611,70 @@ class STCommands(commands.Cog):
 
             path = await core.capture_screenshot()
             if path and os.path.isfile(path):
-                await self._safe_followup(interaction, file_path=path)
+                await interaction.followup.send(
+                    view=MessageActionView(self),
+                    file=discord.File(path),
+                )
             else:
                 content = response.get("content", "")[:1900]
-                await interaction.followup.send(f"```\n{content}\n```")
+                view = MessageActionView(self)
+                await interaction.followup.send(f"```\n{content}\n```", view=view)
         finally:
             core.release_lock()
 
+    # ═══════════════════════════════════════════════════════
+    #  /chat
+    # ═══════════════════════════════════════════════════════
+
     @app_commands.command(name="chat", description="查看最近聊天列表或切换到指定聊天")
     @app_commands.describe(index="聊天序号（不填则列出所有聊天）")
-
     async def cmd_chat(self, interaction: discord.Interaction, index: int = -1):
         if not await self._check_whitelist(interaction):
             return
         await interaction.response.defer()
 
+        pending = self._get_pending(interaction.user.id)
+
+        # 如果在 chat_pick_for_char pending 状态，优先使用角色聊天列表
+        if index >= 0 and pending and pending["action"] == "chat_pick_for_char":
+            chats = pending["data"]
+            char_name = pending.get("char_name", "")
+            if index >= len(chats):
+                await interaction.followup.send(f"序号超出范围，共 {len(chats)} 条聊天。")
+                return
+            chat = chats[index]
+            file_name = chat.get("file_name", "")
+            if not file_name:
+                await interaction.followup.send("无法获取聊天文件名。")
+                return
+            ok = await core.open_chat(file_name)
+            if not ok:
+                await interaction.followup.send("切换聊天失败。")
+                return
+            self._clear_pending(interaction.user.id)
+            await asyncio.sleep(2)
+            path = await core.capture_screenshot()
+            name = file_name.replace(".jsonl", "")
+            if path and os.path.isfile(path):
+                await _safe_followup(
+                    interaction, content=f"已切换到: {name}", file_path=path,
+                    view=MessageActionView(self),
+                )
+            else:
+                await interaction.followup.send("截图失败...")
+            return
+
+        # 正常流程：获取全局聊天列表
         chats = await core.fetch_recent_chats()
         if not chats:
             await interaction.followup.send("获取聊天列表失败。")
             return
 
         if index >= 0:
+            # 如果有 chat_pick pending，使用 pending 数据
+            if pending and pending["action"] == "chat_pick":
+                chats = pending["data"]
+
             if index >= len(chats):
                 await interaction.followup.send(f"序号超出范围，共 {len(chats)} 条聊天。")
                 return
@@ -276,16 +690,21 @@ class STCommands(commands.Cog):
                 await interaction.followup.send("切换聊天失败。")
                 return
 
+            self._clear_pending(interaction.user.id)
             await asyncio.sleep(2)
             path = await core.capture_screenshot()
             if path and os.path.isfile(path):
                 name = file_name.replace(".jsonl", "")
-                await self._safe_followup(interaction, content=f"已切换到: {name}", file_path=path)
+                await _safe_followup(
+                    interaction, content=f"已切换到: {name}", file_path=path,
+                    view=MessageActionView(self),
+                )
             else:
                 await interaction.followup.send("截图失败...")
             return
 
-        # 无参数：列出聊天列表
+        # 无参数：列出聊天列表（带按钮）
+        self._set_pending(interaction.user.id, "chat_pick", chats)
         lines = [f"**最近聊天 ({len(chats)}条)**"]
         for i, c in enumerate(chats[:20]):
             ch_name = c.get("file_name", "?").replace(".jsonl", "")
@@ -294,23 +713,100 @@ class STCommands(commands.Cog):
             lines.append(f"`{i}` — {ch_name}  _(消息:{items})_")
             if mes:
                 lines.append(f"> {mes}")
-
         if len(chats) > 20:
             lines.append(f"...还有 {len(chats) - 20} 条")
+        lines.append(f"使用按钮选择聊天，或 `/chat <序号>` / `/exit` 退出")
 
         msg = "\n".join(lines)
         if len(msg) > 2000:
             msg = msg[:1950] + "\n...(截断)"
-        await interaction.followup.send(msg)
+
+        view = ListSelectView(self, chats, "chat_pick",
+                              channel_id=interaction.channel_id,
+                              user_id=interaction.user.id)
+        sent = await interaction.followup.send(msg, view=view)
+        view._message_id = sent.id
+
+    # ═══════════════════════════════════════════════════════
+    #  /char
+    # ═══════════════════════════════════════════════════════
 
     @app_commands.command(name="char", description="查看角色卡列表或选择角色")
     @app_commands.describe(index="角色序号（不填则列出所有角色）")
-
     async def cmd_char(self, interaction: discord.Interaction, index: int = -1):
         if not await self._check_whitelist(interaction):
             return
         await interaction.response.defer()
 
+        pending = self._get_pending(interaction.user.id)
+
+        # 如果在 char_pick pending 状态，使用 pending 数据
+        if index >= 0 and pending and pending["action"] == "char_pick":
+            chars = pending["data"]
+            if index >= len(chars):
+                await interaction.followup.send(f"序号超出范围，共 {len(chars)} 个角色。")
+                return
+
+            char = chars[index]
+            avatar = char.get("avatar", "")
+            char_name = char.get("name", "?")
+
+            chats = await core.fetch_character_chats(avatar)
+            if not chats:
+                await interaction.followup.send(f"角色 **{char_name}** 没有聊天记录。")
+                self._clear_pending(interaction.user.id)
+                return
+
+            if len(chats) == 1:
+                file_name = chats[0].get("file_name", "")
+                if not file_name:
+                    await interaction.followup.send("无法获取聊天文件名。")
+                    self._clear_pending(interaction.user.id)
+                    return
+                ok = await core.open_chat(file_name)
+                if not ok:
+                    await interaction.followup.send("切换聊天失败。")
+                    self._clear_pending(interaction.user.id)
+                    return
+                self._clear_pending(interaction.user.id)
+                await asyncio.sleep(2)
+                path = await core.capture_screenshot()
+                if path and os.path.isfile(path):
+                    await _safe_followup(
+                        interaction, content=f"已切换到: {char_name}", file_path=path,
+                        view=MessageActionView(self),
+                    )
+                else:
+                    await interaction.followup.send("截图失败...")
+            else:
+                lines = [f"**{char_name} 的聊天记录 ({len(chats)}条)**"]
+                for i, c in enumerate(chats[:20]):
+                    fname = c.get("file_name", "?").replace(".jsonl", "")
+                    items = c.get("chat_items", 0)
+                    lines.append(f"`{i}` — {fname}  _(消息:{items})_")
+                if len(chats) > 20:
+                    lines.append(f"...还有 {len(chats) - 20} 条")
+                lines.append(f"使用按钮选择聊天，或 `/chat <序号>` / `/exit` 退出")
+
+                msg = "\n".join(lines)
+                if len(msg) > 2000:
+                    msg = msg[:1950] + "\n...(截断)"
+
+                self._set_pending(
+                    interaction.user.id, "chat_pick_for_char", chats,
+                    char_name=char_name,
+                )
+                view = ListSelectView(
+                    self, chats, "chat_pick_for_char",
+                    channel_id=interaction.channel_id,
+                    user_id=interaction.user.id,
+                    char_name=char_name,
+                )
+                sent = await interaction.followup.send(msg, view=view)
+                view._message_id = sent.id
+            return
+
+        # 正常流程：获取所有角色卡
         chars = await core.fetch_characters()
         if not chars:
             await interaction.followup.send("获取角色卡列表失败。")
@@ -342,25 +838,42 @@ class STCommands(commands.Cog):
                 await asyncio.sleep(2)
                 path = await core.capture_screenshot()
                 if path and os.path.isfile(path):
-                    await self._safe_followup(interaction, content=f"已切换到: {char_name}", file_path=path)
+                    await _safe_followup(
+                        interaction, content=f"已切换到: {char_name}", file_path=path,
+                        view=MessageActionView(self),
+                    )
                 else:
                     await interaction.followup.send("截图失败...")
             else:
                 lines = [f"**{char_name} 的聊天记录 ({len(chats)}条)**"]
-                for i, c in enumerate(chats[:15]):
+                for i, c in enumerate(chats[:20]):
                     fname = c.get("file_name", "?").replace(".jsonl", "")
                     items = c.get("chat_items", 0)
                     lines.append(f"`{i}` — {fname}  _(消息:{items})_")
-                if len(chats) > 15:
-                    lines.append(f"...还有 {len(chats) - 15} 条")
-                lines.append(f"使用 `/chat <序号>` 选择聊天")
+                if len(chats) > 20:
+                    lines.append(f"...还有 {len(chats) - 20} 条")
+                lines.append(f"使用按钮选择聊天，或 `/chat <序号>` / `/exit` 退出")
+
                 msg = "\n".join(lines)
                 if len(msg) > 2000:
                     msg = msg[:1950] + "\n...(截断)"
-                await interaction.followup.send(msg)
+
+                self._set_pending(
+                    interaction.user.id, "chat_pick_for_char", chats,
+                    char_name=char_name,
+                )
+                view = ListSelectView(
+                    self, chats, "chat_pick_for_char",
+                    channel_id=interaction.channel_id,
+                    user_id=interaction.user.id,
+                    char_name=char_name,
+                )
+                sent = await interaction.followup.send(msg, view=view)
+                view._message_id = sent.id
             return
 
-        # 无参数：列出角色卡
+        # 无参数：列出角色卡（带按钮）
+        self._set_pending(interaction.user.id, "char_pick", chars)
         import datetime as dt
         lines = [f"**角色卡列表 ({len(chars)}个)**"]
         for i, c in enumerate(chars[:25]):
@@ -377,13 +890,21 @@ class STCommands(commands.Cog):
 
         if len(chars) > 25:
             lines.append(f"...还有 {len(chars) - 25} 个")
-        lines.append(f"使用 `/char <序号>` 选择角色查看聊天")
+        lines.append(f"使用按钮选择角色，或 `/char <序号>` / `/exit` 退出")
 
         msg = "\n".join(lines)
         if len(msg) > 2000:
             msg = msg[:1950] + "\n...(截断)"
-        await interaction.followup.send(msg)
 
+        view = ListSelectView(self, chars, "char_pick",
+                              channel_id=interaction.channel_id,
+                              user_id=interaction.user.id)
+        sent = await interaction.followup.send(msg, view=view)
+        view._message_id = sent.id
+
+    # ═══════════════════════════════════════════════════════
+    #  /user
+    # ═══════════════════════════════════════════════════════
 
     @app_commands.command(name="user", description="查看用户设定列表或选择用户设定")
     @app_commands.describe(index="用户设定序号（不填则列出所有用户设定）")
@@ -391,6 +912,24 @@ class STCommands(commands.Cog):
         if not await self._check_whitelist(interaction):
             return
         await interaction.response.defer()
+
+        pending = self._get_pending(interaction.user.id)
+
+        # 如果在 user_pick pending 状态，使用 pending 数据
+        if index >= 0 and pending and pending["action"] == "user_pick":
+            personas = pending["data"]
+            if index >= len(personas):
+                await interaction.followup.send(f"序号超出范围，共 {len(personas)} 个用户设定。")
+                return
+            p = personas[index]
+            ok = await core.select_persona(p["avatar_id"])
+            if not ok:
+                await interaction.followup.send("切换用户设定失败。")
+                return
+            self._clear_pending(interaction.user.id)
+            current = await core.get_current_persona()
+            await interaction.followup.send(f"已切换用户设定为: **{current}** _(序号:{index})_")
+            return
 
         personas = await core.fetch_personas()
         if not personas:
@@ -409,26 +948,42 @@ class STCommands(commands.Cog):
                 return
 
             current = await core.get_current_persona()
-            await interaction.followup.send(
-                f"已切换用户设定为: **{current}** _(序号:{index})_"
-            )
+            await interaction.followup.send(f"已切换用户设定为: **{current}** _(序号:{index})_")
             return
 
-        # 无参数：列出用户设定
+        # 无参数：列出用户设定（带按钮）
+        self._set_pending(interaction.user.id, "user_pick", personas)
         lines = [f"**用户设定列表 ({len(personas)}个)**"]
-        for i, p in enumerate(personas):
+        for i, p in enumerate(personas[:20]):
             name = p.get("name", "?")
             desc = (p.get("description", "") or "[无描述]")[:80]
             lines.append(f"`{i}` — **{name}**")
             if desc:
                 lines.append(f"> {desc}")
-
-        lines.append(f"使用 `/user <序号>` 选择用户设定")
+        if len(personas) > 20:
+            lines.append(f"...还有 {len(personas) - 20} 个")
+        lines.append(f"使用按钮选择用户设定，或 `/user <序号>` / `/exit` 退出")
 
         msg = "\n".join(lines)
         if len(msg) > 2000:
             msg = msg[:1950] + "\n...(截断)"
-        await interaction.followup.send(msg)
+
+        view = ListSelectView(self, personas, "user_pick",
+                              channel_id=interaction.channel_id,
+                              user_id=interaction.user.id)
+        sent = await interaction.followup.send(msg, view=view)
+        view._message_id = sent.id
+
+    # ═══════════════════════════════════════════════════════
+    #  /exit
+    # ═══════════════════════════════════════════════════════
+
+    @app_commands.command(name="exit", description="退出当前输入窗口")
+    async def cmd_exit(self, interaction: discord.Interaction):
+        if not await self._check_whitelist(interaction):
+            return
+        self._clear_pending(interaction.user.id)
+        await interaction.response.send_message("已退出输入窗口。", ephemeral=True)
 
 
 async def setup(bot):

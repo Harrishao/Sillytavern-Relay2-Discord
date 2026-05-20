@@ -2,6 +2,12 @@
 
 通过 Discord 斜杠命令远程操控 [SillyTavern](https://github.com/SillyTavern/SillyTavern) ，支持消息发送、截图回传、角色/聊天/用户设定管理等功能。
 
+## 快速开始
+
+1. 前往 [Discord开发者门户](https://discord.com/developers/home) ，创建一个机器人，获取机器人 Tokens
+2. 按照下方步骤配置项目，将 Tokens 填入 `config.ini`
+3. 确保酒馆已经在本地运行，启动程序
+
 ## 功能
 
 | 命令 | 说明                          |
